@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import re
+import hashlib
 import shutil
 import sqlite3
 import subprocess
@@ -64,6 +65,9 @@ PROFILE_KEY = "profile-420fd454-0c36-499d-bde4-146823b16147"
 
 # Set by --dry-run. When true, nothing is written and no process is stopped.
 DRY_RUN = False
+
+# Set by --archive. When set, every backup is also packed into one file.
+ARCHIVE_FORMAT: Optional[str] = None
 OLD_PREFIX = "mx-ergo-6b01d"
 NEW_PREFIX = "mx-ergo-s-2b03e"
 BACKUP_DIR_PREFIX = "_migration_backup_"
@@ -889,7 +893,98 @@ def make_backup(plat: Platform) -> Path:
         if f.exists():
             shutil.copy2(f, bdir / f.name)
             log.info("  backed up %s", f.name)
+    # A checksum list travels with the data, so a copy can be verified later.
+    manifest = bdir / "MANIFEST.sha256"
+    lines = []
+    for f in sorted(bdir.rglob("*")):
+        if f.is_file() and f != manifest:
+            digest = hashlib.sha256(f.read_bytes()).hexdigest()
+            lines.append(f"{digest}  {f.relative_to(bdir)}")
+    manifest.write_text("\n".join(lines) + "\n")
+    if ARCHIVE_FORMAT:
+        archive_backup(bdir, ARCHIVE_FORMAT)
     return bdir
+
+
+ARCHIVE_FORMATS = ("7z", "zip", "tgz")
+DEFAULT_ARCHIVE_FORMAT = "7z"
+
+# Where a 7-Zip binary is usually found. The tool needs no dependency for zip or
+# tgz, which are standard library; 7z is the one format that needs a program.
+SEVENZIP_CANDIDATES = ("7z", "7za", "7zz", "7zr")
+SEVENZIP_WINDOWS = (
+    Path("/mnt/c/Program Files/7-Zip/7z.exe"),
+    Path("/mnt/c/Program Files (x86)/7-Zip/7z.exe"),
+    Path("C:/Program Files/7-Zip/7z.exe"),
+)
+
+
+def find_7zip() -> Optional[str]:
+    """A 7-Zip binary, from PATH or a standard Windows install."""
+    for name in SEVENZIP_CANDIDATES:
+        found = shutil.which(name)
+        if found:
+            return found
+    for candidate in SEVENZIP_WINDOWS:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _arg_for(binary: str, path: Path) -> str:
+    """Render a path the way the chosen binary expects it.
+
+    A Windows 7z.exe called from WSL cannot read `/home/...`; it needs the
+    Windows form of the same location.
+    """
+    if binary.lower().endswith(".exe") and sys.platform != "win32":
+        cp = _run(["wslpath", "-w", str(path)])
+        if cp.returncode == 0 and cp.stdout.strip():
+            return cp.stdout.strip()
+    return str(path)
+
+
+def archive_backup(bdir: Path, fmt: str) -> Path:
+    """Pack a backup directory into one file, for copying to a drive or a phone.
+
+    `tgz` is written in GNU format on purpose. Python defaults to PAX, and
+    7-Zip cannot read the PAX extended headers, which is exactly how a macOS
+    `tar` archive fails to open on Windows.
+    """
+    if fmt not in ARCHIVE_FORMATS:
+        raise SystemExit(red(f"unknown archive format {fmt!r}; use one of {ARCHIVE_FORMATS}"))
+    if not bdir.is_dir():
+        raise SystemExit(red(f"not a directory: {bdir}"))
+    files = sorted(f for f in bdir.rglob("*") if f.is_file())
+    if fmt == "7z":
+        binary = find_7zip()
+        if binary is None:
+            raise SystemExit(red(
+                "no 7-Zip binary found. Install p7zip (`sudo apt install p7zip-full`) "
+                "or 7-Zip for Windows, or choose --archive zip, which needs nothing."))
+        out = bdir.with_suffix(bdir.suffix + ".7z")
+        out.unlink(missing_ok=True)
+        cp = _run([binary, "a", "-t7z", "-mx=9", "-bso0", "-bsp0",
+                   _arg_for(binary, out), _arg_for(binary, bdir)])
+        if cp.returncode != 0 or not out.exists():
+            raise SystemExit(red(
+                f"7-Zip failed (exit {cp.returncode}).\n  {cp.stdout.strip()}\n  {cp.stderr.strip()}"))
+    elif fmt == "zip":
+        import zipfile
+        out = bdir.with_suffix(bdir.suffix + ".zip")
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in files:
+                z.write(f, arcname=str(Path(bdir.name) / f.relative_to(bdir)))
+    else:
+        import tarfile
+        out = bdir.with_suffix(bdir.suffix + ".tar.gz")
+        with tarfile.open(out, "w:gz", format=tarfile.GNU_FORMAT) as tar:
+            for f in files:
+                tar.add(f, arcname=str(Path(bdir.name) / f.relative_to(bdir)))
+    total = sum(f.stat().st_size for f in files)
+    log.info("  %s archive: %s (%d file(s), %.1f MB -> %.1f MB)",
+             green("✓"), out, len(files), total / 1e6, out.stat().st_size / 1e6)
+    return out
 
 
 def restore_from_backup(plat: Platform, backup_dir: Path, assume_yes: bool) -> None:
@@ -2230,6 +2325,15 @@ def parse_args() -> argparse.Namespace:
                          "UAC prompt, then confirm the outcome from the result file "
                          "it writes. Requires -y.")
     ap.add_argument("--result-file", metavar="PATH", help=argparse.SUPPRESS)
+    ap.add_argument("--archive", metavar="FORMAT", nargs="?",
+                    choices=ARCHIVE_FORMATS, const=DEFAULT_ARCHIVE_FORMAT,
+                    help=f"also pack each backup into one file for sharing: "
+                         f"{', '.join(ARCHIVE_FORMATS)}. Defaults to "
+                         f"{DEFAULT_ARCHIVE_FORMAT} when the flag is given with no value. "
+                         f"7z needs a 7-Zip binary; zip and tgz need nothing.")
+    ap.add_argument("--archive-backup", metavar="DIR",
+                    help="pack an existing backup folder and exit. Use with --archive "
+                         f"to choose the format; the default is {DEFAULT_ARCHIVE_FORMAT}.")
     ap.add_argument("--dry-run", action="store_true",
                     help="build and print the plan, then stop. Writes nothing "
                          "and stops no process.")
@@ -2241,6 +2345,12 @@ def main() -> None:
     args = parse_args()
     setup_logging()
     DRY_RUN = args.dry_run
+    global ARCHIVE_FORMAT
+    ARCHIVE_FORMAT = args.archive
+    if args.archive_backup:
+        archive_backup(Path(args.archive_backup).expanduser(),
+                       args.archive or DEFAULT_ARCHIVE_FORMAT)
+        return
 
     if args.elevate:
         if not args.yes:

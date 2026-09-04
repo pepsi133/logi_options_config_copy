@@ -18,6 +18,7 @@ tool does that edit directly in the database, with a backup and a one-command re
 - [Command line modes](#command-line-modes)
 - [What happens during a write](#what-happens-during-a-write)
 - [The preset plan](#the-preset-plan)
+- [Sharing a backup](#sharing-a-backup)
 - [Restore from a backup](#restore-from-a-backup)
 - [Code structure](#code-structure)
 - [Platform differences in the stored configuration](#platform-differences-in-the-stored-configuration)
@@ -120,6 +121,8 @@ first, asks about each risky item, and asks once more before it stops the applic
 | `… --import-layout FILE --map c237=c253` | Rename a slot on import, for a button whose control id changed. |
 | `… --import-layout FILE --translate` | Substitute the closest action of the destination platform. |
 | `… --apply -y --elevate` | From WSL, run against the live Windows install behind a UAC prompt. |
+| `… --archive` | Also pack every backup this run makes into one file (7z by default). |
+| `--archive-backup DIR [--archive FORMAT]` | Pack a backup folder that already exists, then exit. |
 
 `--apply` and `--restore` exclude each other. `-y` also applies to `--restore`.
 `--db` and `--dry-run` combine with any mode.
@@ -194,6 +197,42 @@ The preset skips three slots on purpose:
 - `mouse_scroll_wheel_settings`, because both devices already use `STANDARD`, and the new
   device carries extra thumbwheel data that a copy destroys.
 - `thumb_wheel_adapter`, because the hardware is new and no source slot exists.
+
+## Sharing a backup
+
+A backup is a folder, which is awkward to copy to a drive or a phone. `--archive` packs
+each one into a single file as well, and `--archive-backup` packs a folder that already
+exists:
+
+```bash
+python3 migrate_logi_ergo.py --apply --archive                     # backup, and a .7z beside it
+python3 migrate_logi_ergo.py --archive-backup ./backup-dir         # 7z by default
+python3 migrate_logi_ergo.py --archive-backup ./backup-dir --archive zip
+```
+
+| Format | Needs | Size of one real backup |
+|---|---|---|
+| `7z` (default) | a 7-Zip binary | 35 KB |
+| `zip` | nothing | 174 KB |
+| `tgz` | nothing | 166 KB |
+
+The folder itself is 1.4 MB, so 7z is worth the dependency for anything that has to travel.
+It is found on `PATH` (`7z`, `7za`, `7zz`, `7zr`) or at the standard Windows install
+location, and a Windows `7z.exe` called from WSL gets Windows-form paths. Without a binary
+the tool says so and points at `zip`, which needs nothing.
+
+`zip` opens natively in Windows Explorer and macOS Finder. `tgz` is written in **GNU tar
+format on purpose**: Python defaults to POSIX PAX, whose extended headers 7-Zip cannot
+read, which is exactly how a macOS `tar` archive fails to open on Windows.
+
+Every backup carries a `MANIFEST.sha256`, so a copy can be checked after it travels:
+
+```bash
+cd extracted-backup && sha256sum -c MANIFEST.sha256
+```
+
+The manifest excludes itself. A manifest that lists its own checksum can never verify,
+because writing the line changes the file it describes.
 
 ## Restore from a backup
 
