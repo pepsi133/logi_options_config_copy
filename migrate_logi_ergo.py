@@ -72,6 +72,11 @@ OLD_PREFIX = "mx-ergo-6b01d"
 NEW_PREFIX = "mx-ergo-s-2b03e"
 BACKUP_DIR_PREFIX = "_migration_backup_"
 
+# Backups from two machines end up side by side in the same folder once they are
+# copied around, and a macOS backup restored onto Windows would write the wrong
+# schema. The name says where it came from.
+OS_TAG = {"darwin": "macos", "win32": "windows", "linux": "linux"}
+
 # Human-readable device name lookup (best-effort)
 DEVICE_NAMES: dict[str, str] = {
     "mx-ergo-6b01d": "MX Ergo",
@@ -865,12 +870,63 @@ def describe_plan_item(data: dict, item: PlanItem) -> str:
 # Backup / restore
 # ---------------------------------------------------------------------------
 
+def document_host(data: dict, os_type: str) -> Optional[str]:
+    """The name of the host running `os_type`, as the device itself recorded it.
+
+    Easy-Switch stores one entry per paired computer, each with the operating
+    system of that host. That is the right source for labelling a backup: the
+    machine the configuration belongs to, not the machine reading the file.
+    """
+    easy = data.get("easy_switch", {})
+    for entry in (easy.get("devices", []) if isinstance(easy, dict) else []):
+        device = entry.get("device", entry) if isinstance(entry, dict) else {}
+        for host in device.get("hosts", []) if isinstance(device, dict) else []:
+            if not isinstance(host, dict):
+                continue
+            if host.get("os", {}).get("type") == os_type and host.get("name"):
+                return str(host["name"])
+    return None
+
+
+def machine_tag(db: Optional[Path] = None) -> str:
+    """`<os>-<host>`, safe for a filename, for labelling a backup.
+
+    The operating system is the one the *configuration* was written on, not the
+    one the tool happens to run on: a Windows database copied to a Linux box and
+    backed up there is still a Windows backup. The card vocabulary in the
+    document decides; the running platform is only the fallback.
+    """
+    host = ""
+    try:
+        import platform as _platform          # stdlib; no network, no socket import
+        host = _platform.node() or ""
+    except Exception:                          # noqa: BLE001 - a label is never worth failing for
+        host = ""
+    host = re.sub(r"[^A-Za-z0-9]+", "-", host).strip("-").lower()[:24]
+    os_name = OS_TAG.get(sys.platform, sys.platform)
+    if db is not None and db.exists():
+        try:
+            _, doc = load_settings(db, for_write=False)
+            detected = document_platform(doc)
+            if detected:
+                os_name = OS_TAG.get({"WINDOWS": "win32", "MACOS": "darwin"}[detected], os_name)
+                recorded = document_host(doc, detected)
+                if recorded:
+                    host = re.sub(r"[^A-Za-z0-9]+", "-", recorded).strip("-").lower()[:24]
+                elif OS_TAG.get(sys.platform) != os_name:
+                    host = ""                  # do not label foreign data with this host
+        except Exception:                      # noqa: BLE001 - a label never fails a backup
+            pass
+    return f"{os_name}-{host}" if host else os_name
+
+
 def make_backup(plat: Platform) -> Path:
     lop_dir = plat.get_lop_dir()
     settings_db = plat.settings_db
     macros_db = plat.macros_db
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    bdir = lop_dir / f"{BACKUP_DIR_PREFIX}{ts}"
+    tag = machine_tag(settings_db)
+    bdir = lop_dir / f"{BACKUP_DIR_PREFIX}{tag}_{ts}"
     # Two runs inside one second would otherwise collide, and the failure lands
     # after the application has been stopped, leaving it stopped.
     for attempt in range(1, 100):
@@ -878,7 +934,7 @@ def make_backup(plat: Platform) -> Path:
             bdir.mkdir(parents=True, exist_ok=False)
             break
         except FileExistsError:
-            bdir = lop_dir / f"{BACKUP_DIR_PREFIX}{ts}-{attempt}"
+            bdir = lop_dir / f"{BACKUP_DIR_PREFIX}{tag}_{ts}-{attempt}"
     else:
         raise SystemExit(red(f"could not create a backup directory under {lop_dir}"))
     files_to_back_up = [
@@ -1297,7 +1353,8 @@ def list_backups(plat: Platform) -> list[Path]:
         files = list(b.glob("*.db*"))
         has_log = (b / "migration.log").exists()
         extra = " (has migration.log)" if has_log else ""
-        print(f"    {i}. {b.name}  — {len(files)} file(s){extra}")
+        origin = b.name[len(BACKUP_DIR_PREFIX):].rsplit("_", 1)[0] if b.name.startswith(BACKUP_DIR_PREFIX) else "?"
+        print(f"    {i}. {b.name}  — from {origin}, {len(files)} file(s){extra}")
         print(f"       {b}")
     print()
     return backups
@@ -1757,7 +1814,15 @@ def keystroke_card(modifiers: list, key: Optional[str],
     chord: modifiers ascending, `virtualKeyId` present, four tags. `key` may be
     None, which is how a gesture holds a modifier on its own.
     """
-    mods = sorted({MODIFIER_IDS[m.lower()] for m in modifiers})
+    # Keep the order the layout gives. The application records the order the
+    # keys were pressed, and a chord is a set, so order carries no behaviour --
+    # but preserving it makes an export and re-import byte-identical.
+    seen: list = []
+    for name in modifiers:
+        code = MODIFIER_IDS[name.lower()]
+        if code not in seen:
+            seen.append(code)
+    mods = seen
     if key is None:
         keystroke: dict = {"modifiers": mods}
         if display:
@@ -1968,7 +2033,35 @@ def export_layout(data: dict, prefix: str) -> dict:
             }
         else:
             slots[suffix] = {"mode": None, "action": describe_action(card)}
-    return {"version": LAYOUT_VERSION, "device": prefix, "slots": slots}
+    # JSON has no comments, so the guidance rides in `_comment` keys, which the
+    # reader ignores. `target` and `slot_aliases` make the file self-describing:
+    # with them set, an import needs no flags at all.
+    return {
+        "version": LAYOUT_VERSION,
+        "_comment": (
+            "Layout for one device. Edit `target` to the destination slot prefix and "
+            "`slot_aliases` to rename slots whose control id differs between device "
+            "generations, then import with no flags: --import-layout FILE"
+        ),
+        "exported": {
+            "from_device": prefix,
+            "platform": document_platform(data) or "UNKNOWN",
+            "at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        },
+        "device": prefix,
+        "target": None,
+        "_comment_target": (
+            "Destination slot prefix. null means the destination must be given with "
+            "--device. Set it here to make the file stand alone."
+        ),
+        "slot_aliases": {},
+        "_comment_slot_aliases": (
+            "Source slot -> destination slot, for a button whose control id changed. "
+            "Example: {\"c237\": \"c253\"} for the MX Ergo top button on an MX Ergo S. "
+            "--map on the command line is merged over whatever is set here."
+        ),
+        "slots": slots,
+    }
 
 
 def import_layout(data: dict, layout: dict, prefix: str,
@@ -2381,11 +2474,20 @@ def main() -> None:
     if not settings_db.exists():
         raise SystemExit(red(f"settings.db not found at {settings_db}"))
 
+    if args.import_layout and not args.device:
+        # A layout that names its own target needs no flags.
+        peek = json.loads(Path(args.import_layout).expanduser().read_text())
+        if peek.get("target"):
+            args.device = peek["target"]
+            log.info("target from the layout file: %s", args.device)
+
     if args.export_layout or args.import_layout:
         if not args.device:
             _, peek = load_settings(settings_db, for_write=False)
             names = ", ".join(sorted(discover_devices(peek)))
-            raise SystemExit(red(f"--device is required. Devices in this database: {names}"))
+            raise SystemExit(red(
+                f"--device is required, or set \"target\" in the layout file.\n"
+                f"  Devices in this database: {names}"))
 
     if args.export_layout:
         _, data = load_settings(settings_db, for_write=False)

@@ -285,7 +285,10 @@ meant to be read and edited by hand:
 ```json
 {
   "version": 1,
+  "exported": {"from_device": "mx-ergo-6b01d", "platform": "WINDOWS", "at": "..."},
   "device": "mx-ergo-6b01d",
+  "target": "mx-ergo-s-2b03e",
+  "slot_aliases": {"c237": "c253"},
   "slots": {
     "c86": {
       "mode": "custom_gesture",
@@ -311,6 +314,17 @@ than writing something the application may reject:
 ! c83.left — this database has no card for system 'SWITCH_BETWEEN_DESKTOPS_LEFT';
              assign it once in Logi Options+, then re-import.
 ```
+
+A layout can name its own destination. Set `target` and `slot_aliases` in the file and
+the import needs no flags at all:
+
+```bash
+python3 migrate_logi_ergo.py --import-layout my-layout.json
+```
+
+`--device` and `--map` still win when given, so the file holds the usual case and the
+command line handles the exception. JSON has no comments, so each field is explained by a
+neighbouring `_comment` key that the reader ignores.
 
 Two switches handle the two kinds of mismatch:
 
