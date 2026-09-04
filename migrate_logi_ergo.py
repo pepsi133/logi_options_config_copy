@@ -37,11 +37,13 @@ import ctypes
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -56,7 +58,12 @@ if sys.platform == "darwin":
 # Constants
 # ---------------------------------------------------------------------------
 
+# Fallback only. The profile key is resolved from the document at runtime
+# (see resolve_profile); this constant is used when the document names no profile.
 PROFILE_KEY = "profile-420fd454-0c36-499d-bde4-146823b16147"
+
+# Set by --dry-run. When true, nothing is written and no process is stopped.
+DRY_RUN = False
 OLD_PREFIX = "mx-ergo-6b01d"
 NEW_PREFIX = "mx-ergo-s-2b03e"
 BACKUP_DIR_PREFIX = "_migration_backup_"
@@ -504,21 +511,78 @@ class WindowsPlatform(Platform):
         ))
 
 
-def get_platform() -> Platform:
-    """Auto-detect and return the appropriate platform instance."""
+class FilePlatform(Platform):
+    """A settings.db given on the command line, with no running application.
+
+    This is what makes the tool usable on a machine that has no Logi Options+
+    install: a copy of someone else's database, a backup, or a test fixture.
+    It also makes Linux and WSL usable, where the application does not exist.
+    Nothing is stopped and nothing is started, because nothing is running.
+    """
+
+    def __init__(self, db: Path):
+        self._db = db.expanduser().resolve()
+
+    def get_lop_dir(self) -> Path:
+        return self._db.parent
+
+    @property
+    def settings_db(self) -> Path:
+        return self._db
+
+    def stop_logi_options(self, assume_yes: bool) -> None:
+        log.info("offline mode (--db): no process is stopped")
+        return None
+
+    def start_logi_options(self, stop_context: Any) -> None:
+        log.info("offline mode (--db): no process is started")
+
+    def wait_db_free(self, db: Path, timeout_s: int = 20) -> None:
+        if not db.exists():
+            raise SystemExit(red(f"{db} does not exist"))
+        log.info("  offline mode: assuming %s is free", db.name)
+
+
+def get_platform(db: Optional[Path] = None) -> Platform:
+    """Return the platform implementation for this run."""
+    if db is not None:
+        return FilePlatform(db)
     if sys.platform == "darwin":
         return MacOSPlatform()
     elif sys.platform == "win32":
         return WindowsPlatform()
     else:
-        raise SystemExit(red(f"Unsupported platform: {sys.platform}"))
+        raise SystemExit(red(
+            f"Unsupported platform: {sys.platform}.\n"
+            "Logi Options+ has no build for it. To read or edit a database copied "
+            "from another machine, pass --db PATH."))
 
 
 # ---------------------------------------------------------------------------
 # Database operations
 # ---------------------------------------------------------------------------
 
-def load_settings(db: Path) -> tuple[int, dict]:
+def load_settings(db: Path, for_write: bool = True) -> tuple[int, dict]:
+    """Read the configuration document out of the single blob row.
+
+    `for_write=False` opens the file read-only and skips the checkpoint, so the
+    menu's inspection items never touch a database the application is using.
+    A checkpoint is a write: it rewrites the main file from the log.
+    """
+    if not for_write:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                row = con.execute("SELECT _id, file FROM data").fetchone()
+                if row is None:
+                    raise RuntimeError("settings.db has no row in `data`")
+                return row[0], json.loads(row[1])
+            finally:
+                con.close()
+        except sqlite3.OperationalError as e:
+            # A database with an unread write-ahead log cannot always be opened
+            # read-only. Fall through and say so rather than fail.
+            log.debug("read-only open failed (%s); falling back", e)
     con = sqlite3.connect(db)
     try:
         con.execute("PRAGMA journal_mode=WAL;")
@@ -533,6 +597,9 @@ def load_settings(db: Path) -> tuple[int, dict]:
 
 def save_settings(db: Path, row_id: int, data: dict) -> None:
     blob = json.dumps(data, separators=(",", ":"))
+    if DRY_RUN:
+        log.info(yellow(f"dry run: not writing {len(blob)} bytes to {db}"))
+        return
     con = sqlite3.connect(db)
     try:
         con.execute("PRAGMA journal_mode=WAL;")
@@ -543,6 +610,46 @@ def save_settings(db: Path, row_id: int, data: dict) -> None:
         con.close()
 
 
+def profile_keys(data: dict) -> list[str]:
+    """Every profile key in the document, most-likely-first.
+
+    `profile_keys` is the document's own index. Fall back to a scan of the
+    top-level keys, then to the historical constant. The default profile carries
+    the same identifier on independent installations, but a configuration can
+    hold several profiles, one per application, so the index is what decides.
+    """
+    keys: list[str] = []
+    for k in data.get("profile_keys", []) or []:
+        if isinstance(k, str) and k in data:
+            keys.append(k)
+    for k in data:
+        if k.startswith("profile-") and k not in keys:
+            keys.append(k)
+    if PROFILE_KEY in data and PROFILE_KEY not in keys:
+        keys.append(PROFILE_KEY)
+    return keys
+
+
+def resolve_profile(data: dict, key: Optional[str] = None) -> dict:
+    """Return the profile object that holds `assignments`.
+
+    Raises SystemExit with an actionable message when the document names none,
+    instead of the bare KeyError the caller used to get after the app was
+    already stopped.
+    """
+    if key is not None:
+        if key not in data:
+            raise SystemExit(red(f"No profile {key!r} in this settings.db"))
+        return data[key]
+    for k in profile_keys(data):
+        prof = data.get(k)
+        if isinstance(prof, dict) and isinstance(prof.get("assignments"), list):
+            return prof
+    raise SystemExit(red(
+        "No profile with an `assignments` list found in this settings.db.\n"
+        f"Top-level keys that look like profiles: {[k for k in data if k.startswith('profile')] or 'none'}"))
+
+
 def find_assignment(assignments: list[dict], slot_id: str) -> Optional[int]:
     for i, a in enumerate(assignments):
         if a.get("slotId") == slot_id:
@@ -550,9 +657,126 @@ def find_assignment(assignments: list[dict], slot_id: str) -> Optional[int]:
     return None
 
 
+# Presentation fields that belong to the destination slot, not to the copied
+# behaviour. A newer device carries icons and preset tags that an older source
+# does not have, and a blind whole-card replace silently drops them.
+PRESENTATION_FIELDS = ("icons", "tags", "name")
+
+
+def retarget_refs(node: Any, src_prefix: str, dst_prefix: str) -> Any:
+    """Rewrite every nested slot reference from the source device to the destination.
+
+    A copied card can name other slots of its own device, for example
+    `mouseSettings.cpsSlotId`. Rewriting only the top-level slotId leaves those
+    pointing back at the source device.
+    """
+    if isinstance(node, dict):
+        return {k: retarget_refs(v, src_prefix, dst_prefix) for k, v in node.items()}
+    if isinstance(node, list):
+        return [retarget_refs(v, src_prefix, dst_prefix) for v in node]
+    if isinstance(node, str) and node.startswith(src_prefix + "_"):
+        return dst_prefix + "_" + node[len(src_prefix) + 1:]
+    return node
+
+
+def copy_card(src_assignment: dict, dst_assignment: dict,
+              src_prefix: str, dst_prefix: str, dst_sid: str) -> dict:
+    """Build the new destination assignment from the source, keeping what is the
+    destination's own: its slot id and its presentation fields."""
+    cloned = copy.deepcopy(src_assignment)
+    cloned = retarget_refs(cloned, src_prefix, dst_prefix)
+    cloned["slotId"] = dst_sid
+    dst_card = dst_assignment.get("card", {})
+    new_card = cloned.get("card")
+    if isinstance(new_card, dict) and isinstance(dst_card, dict):
+        for field in PRESENTATION_FIELDS:
+            if field not in new_card and field in dst_card:
+                new_card[field] = copy.deepcopy(dst_card[field])
+    return cloned
+
+
+# A Smart Action assignment is a card whose attribute is MACRO_REF; its `id` is
+# the UUID of the macro that lives in macros.db. Ordinary cards also carry UUID
+# shaped ids, so the attribute is what identifies the reference, not the shape.
+MACRO_REF_ATTRIBUTE = "MACRO_REF"
+
+
+def macro_refs(node: Any) -> set:
+    """Every Smart Action UUID a card references.
+
+    The macro itself lives in macros.db. A copy of the card without the macro
+    leaves a reference to nothing.
+    """
+    found = set()
+    if isinstance(node, dict):
+        if node.get("attribute") == MACRO_REF_ATTRIBUTE and isinstance(node.get("id"), str):
+            found.add(node["id"])
+        for v in node.values():
+            found |= macro_refs(v)
+    elif isinstance(node, list):
+        for v in node:
+            found |= macro_refs(v)
+    return found
+
+
+def load_macro_ids(macros_db: Path) -> set:
+    """UUIDs of the Smart Actions defined in a macros.db."""
+    if not macros_db.exists():
+        return set()
+    try:
+        con = sqlite3.connect(f"file:{macros_db}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        con = sqlite3.connect(macros_db)
+    try:
+        row = con.execute("SELECT file FROM data").fetchone()
+    finally:
+        con.close()
+    if row is None:
+        return set()
+    blob = row[0]
+    if isinstance(blob, (bytes, bytearray)):
+        blob = blob.decode("utf-8", "replace")
+    doc = json.loads(blob)
+    return {m["id"] for m in doc.get("macro_infos", {}).get("macroInfos", [])
+            if isinstance(m, dict) and isinstance(m.get("id"), str)}
+
+
+def deep_merge(src: Any, dst: Any) -> Any:
+    """Source values win, destination-only keys survive.
+
+    This is what makes a settings slot safe to migrate. A whole-card replace
+    drops the fields a newer device has and an older one never had, such as the
+    thumbwheel block on the MX Ergo S.
+    """
+    if isinstance(src, dict) and isinstance(dst, dict):
+        out = copy.deepcopy(dst)
+        for k, v in src.items():
+            out[k] = deep_merge(v, dst[k]) if k in dst else copy.deepcopy(v)
+        return out
+    return copy.deepcopy(src)
+
+
+def pointer_speed_key(card: dict) -> Optional[str]:
+    """Which pointer-speed schema this card uses.
+
+    macOS stores `active.value`, a float from 0 to 1. Windows stores
+    `active.dpiLevel`, an index into the device's DPI steps. They are different
+    quantities, so a value from one platform must never be written to the other.
+    """
+    active = (card.get("mouseSettings", {})
+                  .get("pointerSpeed", {})
+                  .get("active", {}))
+    if not isinstance(active, dict):
+        return None
+    for key in ("value", "dpiLevel"):
+        if key in active:
+            return key
+    return None
+
+
 def apply_plan(data: dict, plan: list[PlanItem]) -> tuple[list[str], list[tuple[str, str]]]:
     """Mutates `data` in place. Returns (applied_descriptions, skipped_with_reason)."""
-    profile = data[PROFILE_KEY]
+    profile = resolve_profile(data)
     assignments = profile["assignments"]
     applied: list[str] = []
     skipped: list[tuple[str, str]] = []
@@ -573,29 +797,42 @@ def apply_plan(data: dict, plan: list[PlanItem]) -> tuple[list[str], list[tuple[
             continue
 
         if item.mode == "full":
-            cloned = copy.deepcopy(assignments[si])
-            cloned["slotId"] = dst_sid    # rewrite slotId to point at dst button
-            assignments[di] = cloned
+            assignments[di] = copy_card(assignments[si], assignments[di],
+                                        OLD_PREFIX, NEW_PREFIX, dst_sid)
             applied.append(f"{src_sid}  ->  {dst_sid}  (full card replace)")
 
         elif item.mode == "pointer_speed":
-            try:
-                src_val = (assignments[si]["card"]["mouseSettings"]
-                           ["pointerSpeed"]["active"]["value"])
-            except (KeyError, TypeError):
+            src_card = assignments[si].get("card", {})
+            dst_card = assignments[di].get("card", {})
+            src_key = pointer_speed_key(src_card)
+            dst_key = pointer_speed_key(dst_card)
+            if src_key is None:
                 skipped.append((f"{item.src_button}->{item.dst_button}",
-                                "src has no pointerSpeed.active.value"))
+                                "src card has no pointerSpeed.active"))
                 continue
-            try:
-                dst_card = assignments[di]["card"]
-                dst_card["mouseSettings"]["pointerSpeed"]["active"]["value"] = src_val
-            except (KeyError, TypeError):
+            if dst_key is None:
                 skipped.append((f"{item.src_button}->{item.dst_button}",
-                                "dst has unexpected mouseSettings shape"))
+                                "dst card has no pointerSpeed.active"))
                 continue
+            if src_key != dst_key:
+                skipped.append((
+                    f"{item.src_button}->{item.dst_button}",
+                    f"pointer speed schema differs: src uses {src_key!r}, "
+                    f"dst uses {dst_key!r}. macOS stores a 0..1 float, Windows a "
+                    f"DPI step index. Set it by hand in Logi Options+."))
+                continue
+            src_val = src_card["mouseSettings"]["pointerSpeed"]["active"][src_key]
+            dst_card["mouseSettings"]["pointerSpeed"]["active"][dst_key] = src_val
             applied.append(
-                f"{src_sid}  ->  {dst_sid}  (pointerSpeed value -> {src_val})"
+                f"{src_sid}  ->  {dst_sid}  (pointerSpeed {dst_key} -> {src_val})"
             )
+
+        elif item.mode == "merge":
+            merged = deep_merge(assignments[si].get("card", {}),
+                                assignments[di].get("card", {}))
+            assignments[di]["card"] = retarget_refs(merged, OLD_PREFIX, NEW_PREFIX)
+            applied.append(
+                f"{src_sid}  ->  {dst_sid}  (merged, destination-only fields kept)")
 
         else:
             skipped.append((f"{item.src_button}->{item.dst_button}",
@@ -606,7 +843,7 @@ def apply_plan(data: dict, plan: list[PlanItem]) -> tuple[list[str], list[tuple[
 
 def describe_plan_item(data: dict, item: PlanItem) -> str:
     """One-line current state for display."""
-    profile = data[PROFILE_KEY]
+    profile = resolve_profile(data)
     src_sid = f"{OLD_PREFIX}_{item.src_button}"
     dst_sid = f"{NEW_PREFIX}_{item.dst_button}"
     si = find_assignment(profile["assignments"], src_sid)
@@ -630,7 +867,16 @@ def make_backup(plat: Platform) -> Path:
     macros_db = plat.macros_db
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     bdir = lop_dir / f"{BACKUP_DIR_PREFIX}{ts}"
-    bdir.mkdir(parents=True, exist_ok=False)
+    # Two runs inside one second would otherwise collide, and the failure lands
+    # after the application has been stopped, leaving it stopped.
+    for attempt in range(1, 100):
+        try:
+            bdir.mkdir(parents=True, exist_ok=False)
+            break
+        except FileExistsError:
+            bdir = lop_dir / f"{BACKUP_DIR_PREFIX}{ts}-{attempt}"
+    else:
+        raise SystemExit(red(f"could not create a backup directory under {lop_dir}"))
     files_to_back_up = [
         settings_db,
         settings_db.with_name(settings_db.name + "-shm"),
@@ -652,23 +898,42 @@ def restore_from_backup(plat: Platform, backup_dir: Path, assume_yes: bool) -> N
         raise SystemExit(red(f"Backup dir not found: {backup_dir}"))
     setup_logging()
     log.info("Restoring from %s", backup_dir)
-    files = list(backup_dir.glob("settings.db*")) + list(backup_dir.glob("macros.db*"))
+    # Glob on the real file names. With --db the database need not be called
+    # settings.db, and a hardcoded pattern silently restores nothing.
+    names = (plat.settings_db.name, plat.macros_db.name)
+    files = [f for name in names for f in sorted(backup_dir.glob(name + "*"))]
     if not files:
-        raise SystemExit(red(f"No settings.db / macros.db files in {backup_dir}"))
+        raise SystemExit(red(
+            f"No {' / '.join(names)} files in {backup_dir}"))
     for f in files:
         log.info("  will restore %s -> %s", f.name, lop_dir / f.name)
     if not confirm("Stop Logi Options+ and restore these files?",
                    default_no=True, assume_yes=assume_yes):
         log.info("Aborted.")
         return
-    stop_ctx = plat.stop_logi_options(assume_yes)
+    stop_ctx = None if DRY_RUN else plat.stop_logi_options(assume_yes)
     try:
-        plat.wait_db_free(plat.settings_db)
+        if not DRY_RUN:
+            plat.wait_db_free(plat.settings_db)
+        # Clear the live write-ahead logs first. SQLite replays a -wal left over
+        # from a later state on top of the restored file, which silently undoes
+        # the restore.
+        restored = {f.name for f in files}
+        for name in names:
+            for suffix in ("-wal", "-shm", "-journal"):
+                stale = lop_dir / (name + suffix)
+                if stale.exists() and stale.name not in restored:
+                    stale.unlink()
+                    log.info("  cleared stale %s", stale.name)
         for f in files:
+            if DRY_RUN:
+                log.info("  dry run: would restore %s", f.name)
+                continue
             shutil.copy2(f, lop_dir / f.name)
             log.info("  restored %s", f.name)
     finally:
-        plat.start_logi_options(stop_ctx)
+        if not DRY_RUN:
+            plat.start_logi_options(stop_ctx)
     log.info(green("Restore complete."))
 
 
@@ -677,38 +942,65 @@ def restore_from_backup(plat: Platform, backup_dir: Path, assume_yes: bool) -> N
 # ---------------------------------------------------------------------------
 
 
+# Slot suffixes seen in real databases. The fallback splitter uses these when a
+# device prefix is not in the document's own lists.
+SLOT_SUFFIX_RE = re.compile(
+    r"^(?P<prefix>.+?)_(?P<suffix>c\d+"
+    r"|mouse_settings|mouse_scroll_wheel_settings|virtual_precision_mode"
+    r"|thumb_wheel_adapter|backlighting_settings|presenter_settings"
+    r"|webcam_\w+_settings|camera_\w+|[a-z][a-z0-9]*(?:_[a-z0-9]+)*_settings)$"
+)
+
+
+def known_prefixes(data: dict) -> list[str]:
+    """Device prefixes the document names itself, longest first.
+
+    `slot_prefixes_ever_seen` and `ever_connected_devices` are Logi Options+'s
+    own registries. They beat any guess made from the shape of a slot id.
+    """
+    found: set[str] = set(DEVICE_NAMES)
+    for pfx in data.get("slot_prefixes_ever_seen", []) or []:
+        if isinstance(pfx, str):
+            found.add(pfx)
+    ecd = data.get("ever_connected_devices", {})
+    for dev in (ecd.get("devices", []) if isinstance(ecd, dict) else []):
+        pfx = dev.get("slotPrefix") if isinstance(dev, dict) else None
+        if isinstance(pfx, str):
+            found.add(pfx)
+    return sorted(found, key=len, reverse=True)
+
+
+def split_slot_id(slot_id: str, prefixes: list[str]) -> tuple[str, str]:
+    """Split a slotId into (device prefix, slot suffix)."""
+    for pfx in prefixes:
+        if slot_id.startswith(pfx + "_"):
+            return pfx, slot_id[len(pfx) + 1:]
+    m = SLOT_SUFFIX_RE.match(slot_id)
+    if m:
+        return m.group("prefix"), m.group("suffix")
+    return slot_id, ""
+
+
+def is_button_slot(suffix: str) -> bool:
+    """True for a physical control slot such as `c82`, false for a settings slot."""
+    return bool(re.fullmatch(r"c\d+", suffix))
+
+
 def discover_devices(data: dict) -> dict[str, list[str]]:
     """Scan all slotId prefixes and group slot suffixes per device.
 
     Returns {prefix: [suffix, ...]} where suffix is e.g. "c82", "mouse_settings".
     """
-    profile = data.get(PROFILE_KEY, {})
+    profile = resolve_profile(data)
     assignments = profile.get("assignments", [])
+    prefixes = known_prefixes(data)
     devices: dict[str, list[str]] = {}
     for a in assignments:
         sid = a.get("slotId", "")
-        # Try to split on the last _ before a known suffix
-        # Device prefixes can contain hyphens and digits
-        # Slot IDs look like: "mx-ergo-6b01d_c82" or "mx-ergo-6b01d_mouse_settings"
-        # Strategy: find the longest known prefix, or heuristically split
-        matched = False
-        for prefix in sorted(DEVICE_NAMES.keys(), key=len, reverse=True):
-            if sid.startswith(prefix + "_"):
-                suffix = sid[len(prefix) + 1:]
-                devices.setdefault(prefix, []).append(suffix)
-                matched = True
-                break
-        if not matched:
-            # Heuristic: find the split point — look for _c\d+ or known settings suffixes
-            import re
-            m = re.match(r'^(.+?)_(c\d+|mouse_settings|mouse_scroll_wheel_settings|'
-                         r'virtual_precision_mode|thumb_wheel_adapter|presenter_settings|'
-                         r'webcam_\w+|camera_\w+)$', sid)
-            if m:
-                prefix, suffix = m.group(1), m.group(2)
-                devices.setdefault(prefix, []).append(suffix)
-            else:
-                devices.setdefault(sid, []).append("")
+        if not sid:
+            continue
+        prefix, suffix = split_slot_id(sid, prefixes)
+        devices.setdefault(prefix, []).append(suffix)
     return devices
 
 
@@ -720,8 +1012,8 @@ def print_device_list(devices: dict[str, list[str]]) -> None:
     print(bold("\n  Devices found in settings.db:\n"))
     for i, (prefix, slots) in enumerate(sorted(devices.items()), 1):
         name = device_display_name(prefix)
-        buttons = [s for s in slots if s.startswith("c")]
-        settings = [s for s in slots if not s.startswith("c") and s]
+        buttons = [s for s in slots if is_button_slot(s)]
+        settings = [s for s in slots if s and not is_button_slot(s)]
         print(f"    {i}. {name:<28s} ({prefix})")
         print(f"       {len(buttons)} button(s), {len(settings)} setting(s)")
     print()
@@ -729,7 +1021,7 @@ def print_device_list(devices: dict[str, list[str]]) -> None:
 
 def print_device_config(data: dict, prefix: str) -> None:
     """Print all button/setting assignments for a given device prefix."""
-    profile = data.get(PROFILE_KEY, {})
+    profile = resolve_profile(data)
     assignments = profile.get("assignments", [])
     name = device_display_name(prefix)
     print(bold(f"\n  Configuration for {name} ({prefix}):\n"))
@@ -771,7 +1063,7 @@ def print_device_config(data: dict, prefix: str) -> None:
 
 def compare_devices(data: dict, src_prefix: str, dst_prefix: str) -> None:
     """Show a side-by-side comparison of two devices' configs."""
-    profile = data.get(PROFILE_KEY, {})
+    profile = resolve_profile(data)
     assignments = profile.get("assignments", [])
 
     src_slots: dict[str, dict] = {}
@@ -808,7 +1100,7 @@ def compare_devices(data: dict, src_prefix: str, dst_prefix: str) -> None:
 
 def build_dynamic_plan(data: dict, src_prefix: str, dst_prefix: str) -> list[PlanItem]:
     """Build a migration plan from matching slots between two devices."""
-    profile = data.get(PROFILE_KEY, {})
+    profile = resolve_profile(data)
     assignments = profile.get("assignments", [])
 
     src_buttons: set[str] = set()
@@ -823,14 +1115,20 @@ def build_dynamic_plan(data: dict, src_prefix: str, dst_prefix: str) -> list[Pla
     common = sorted(src_buttons & dst_buttons)
     plan: list[PlanItem] = []
     for suffix in common:
-        if suffix.startswith("c"):
+        if is_button_slot(suffix):
             plan.append(PlanItem(suffix, suffix, "full",
                                  f"Button {suffix} (full card copy)"))
         elif suffix == "mouse_settings":
             plan.append(PlanItem(suffix, suffix, "pointer_speed",
                                  "Pointer speed value only",
                                  interactive=True))
-        # Skip settings slots like mouse_scroll_wheel_settings, thumb_wheel_adapter, etc.
+        else:
+            # Every other settings slot the two devices share. `merge` keeps the
+            # fields the destination has and the source does not, so a newer
+            # device never loses a capability the older one lacks.
+            plan.append(PlanItem(suffix, suffix, "merge",
+                                 f"{suffix} (merge, destination keeps its own fields)",
+                                 interactive=True))
 
     src_only = sorted(src_buttons - dst_buttons)
     dst_only = sorted(dst_buttons - src_buttons)
@@ -841,6 +1139,54 @@ def build_dynamic_plan(data: dict, src_prefix: str, dst_prefix: str) -> list[Pla
         print(yellow(f"  Destination-only slots (will keep defaults): {', '.join(dst_only)}"))
 
     return plan
+
+
+def check_macro_refs(data: dict, plan: list[PlanItem], src_prefix: str,
+                     dst_prefix: str, macros_db: Path) -> list[tuple[str, str]]:
+    """Report every planned copy whose card needs a Smart Action.
+
+    Within one machine both devices read the same macros.db, so the reference
+    stays valid. Across machines it does not, which is why this is reported
+    rather than assumed.
+    """
+    profile = resolve_profile(data)
+    assignments = profile.get("assignments", [])
+    known = load_macro_ids(macros_db)
+    problems: list[tuple[str, str]] = []
+    for item in plan:
+        idx = find_assignment(assignments, f"{src_prefix}_{item.src_button}")
+        if idx is None:
+            continue
+        for mid in sorted(macro_refs(assignments[idx])):
+            state = "present in macros.db" if mid in known else red("MISSING from macros.db")
+            problems.append((item.src_button, f"needs Smart Action {mid} ({state})"))
+    for item in plan:
+        idx = find_assignment(assignments, f"{dst_prefix}_{item.dst_button}")
+        if idx is None:
+            continue
+        for mid in sorted(macro_refs(assignments[idx])):
+            problems.append((item.dst_button,
+                             yellow(f"destination currently holds Smart Action {mid}; "
+                                    "this copy replaces it")))
+    return problems
+
+
+def select_items(plan: list[PlanItem], assume_yes: bool = False) -> list[PlanItem]:
+    """Let the user drop any item, not only the ones marked interactive."""
+    if assume_yes:
+        return list(plan)
+    print()
+    if confirm(f"  Include all {len(plan)} item(s)?", default_no=False):
+        return list(plan)
+    accepted: list[PlanItem] = []
+    for item in plan:
+        line = f"    {item.src_button:>22s} -> {item.dst_button:<12s} [{item.mode}]  {item.description}"
+        print(line)
+        if confirm("      include?", default_no=False):
+            accepted.append(item)
+        else:
+            print("      skipped.")
+    return accepted
 
 
 def list_backups(plat: Platform) -> list[Path]:
@@ -916,7 +1262,7 @@ def run_interactive(plat: Platform) -> None:
         if choice == "0" or not choice:
             break
 
-        _, data = load_settings(settings_db)
+        _, data = load_settings(settings_db, for_write=False)
         devices = discover_devices(data)
         dev_list = sorted(devices.keys())
 
@@ -963,15 +1309,16 @@ def run_interactive(plat: Platform) -> None:
             # Show plan
             print(bold(f"\n  Migration plan: {device_display_name(src_prefix)} → "
                        f"{device_display_name(dst_prefix)}\n"))
-            accepted: list[PlanItem] = []
             for item in plan:
-                line = f"    {item.src_button:>20s} → {item.dst_button:<10s}  [{item.mode}]  {item.description}"
-                print(line)
-                if item.interactive:
-                    if not confirm("      -> include this?", default_no=False):
-                        print("      skipped.")
-                        continue
-                accepted.append(item)
+                print(f"    {item.src_button:>20s} → {item.dst_button:<12s}"
+                      f"  [{item.mode}]  {item.description}")
+            for pfx in (src_prefix, dst_prefix):
+                seen_note = device_presence(data, pfx)
+                if seen_note and "NO record" in seen_note:
+                    print(yellow(f"    ! {seen_note}"))
+            for button, note in check_macro_refs(data, plan, src_prefix, dst_prefix, plat.macros_db):
+                print(yellow(f"    ! {button}: {note}"))
+            accepted = select_items(plan)
 
             if not accepted:
                 print(yellow("  Nothing to migrate."))
@@ -1014,15 +1361,21 @@ def run_interactive(plat: Platform) -> None:
 def _execute_migration(plat: Platform, plan: list[PlanItem],
                        src_prefix: str, dst_prefix: str) -> None:
     """Execute a migration plan: stop app, backup, edit DB, restart."""
+    RESULT["action"] = "migrate"
     settings_db = plat.settings_db
-    stop_ctx = plat.stop_logi_options(False)
+    stop_ctx = None if DRY_RUN else plat.stop_logi_options(False)
     try:
-        plat.wait_db_free(settings_db)
+        if not DRY_RUN:
+            plat.wait_db_free(settings_db)
 
-        log.info("Creating backup…")
-        bdir = make_backup(plat)
+        if DRY_RUN:
+            bdir = plat.get_lop_dir() / "(dry run: no backup created)"
+        else:
+            log.info("Creating backup…")
+            bdir = make_backup(plat)
         log.info("  backup dir: %s", bdir)
-        fh = logging.FileHandler(bdir / "migration.log")
+        fh = (logging.NullHandler() if DRY_RUN
+              else logging.FileHandler(bdir / "migration.log"))
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter(
             "%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S"))
@@ -1035,14 +1388,18 @@ def _execute_migration(plat: Platform, plan: list[PlanItem],
             log.warning("Nothing was applied. Skipping write.")
         else:
             save_settings(settings_db, row_id, data2)
-            log.info(green(f"Wrote {len(applied)} change(s) to settings.db:"))
+            verb = "Would write" if DRY_RUN else "Wrote"
+            log.info(green(f"{verb} {len(applied)} change(s) to settings.db:"))
+            RESULT.update(ok=True, applied=list(applied), backup=str(bdir),
+                          skipped=[f"{a}: {b}" for a, b in skipped])
             for a in applied:
                 log.info("  %s", a)
         for sid, why in skipped:
             log.warning("  skipped %s — %s", sid, why)
 
     finally:
-        plat.start_logi_options(stop_ctx)
+        if not DRY_RUN:
+            plat.start_logi_options(stop_ctx)
 
     log.info("")
     log.info(green("Done."))
@@ -1053,7 +1410,7 @@ def _execute_migration(plat: Platform, plan: list[PlanItem],
 def apply_plan_dynamic(data: dict, plan: list[PlanItem],
                        src_prefix: str, dst_prefix: str) -> tuple[list[str], list[tuple[str, str]]]:
     """Like apply_plan but uses dynamic prefixes instead of OLD_PREFIX/NEW_PREFIX."""
-    profile = data[PROFILE_KEY]
+    profile = resolve_profile(data)
     assignments = profile["assignments"]
     applied: list[str] = []
     skipped: list[tuple[str, str]] = []
@@ -1074,29 +1431,43 @@ def apply_plan_dynamic(data: dict, plan: list[PlanItem],
             continue
 
         if item.mode == "full":
-            cloned = copy.deepcopy(assignments[si])
-            cloned["slotId"] = dst_sid
-            assignments[di] = cloned
+            assignments[di] = copy_card(assignments[si], assignments[di],
+                                        src_prefix, dst_prefix, dst_sid)
             applied.append(f"{src_sid}  ->  {dst_sid}  (full card replace)")
 
         elif item.mode == "pointer_speed":
-            try:
-                src_val = (assignments[si]["card"]["mouseSettings"]
-                           ["pointerSpeed"]["active"]["value"])
-            except (KeyError, TypeError):
+            src_card = assignments[si].get("card", {})
+            dst_card = assignments[di].get("card", {})
+            src_key = pointer_speed_key(src_card)
+            dst_key = pointer_speed_key(dst_card)
+            if src_key is None:
                 skipped.append((f"{item.src_button}->{item.dst_button}",
-                                "src has no pointerSpeed.active.value"))
+                                "src card has no pointerSpeed.active"))
                 continue
-            try:
-                dst_card = assignments[di]["card"]
-                dst_card["mouseSettings"]["pointerSpeed"]["active"]["value"] = src_val
-            except (KeyError, TypeError):
+            if dst_key is None:
                 skipped.append((f"{item.src_button}->{item.dst_button}",
-                                "dst has unexpected mouseSettings shape"))
+                                "dst card has no pointerSpeed.active"))
                 continue
+            if src_key != dst_key:
+                skipped.append((
+                    f"{item.src_button}->{item.dst_button}",
+                    f"pointer speed schema differs: src uses {src_key!r}, "
+                    f"dst uses {dst_key!r}. macOS stores a 0..1 float, Windows a "
+                    f"DPI step index. Set it by hand in Logi Options+."))
+                continue
+            src_val = src_card["mouseSettings"]["pointerSpeed"]["active"][src_key]
+            dst_card["mouseSettings"]["pointerSpeed"]["active"][dst_key] = src_val
             applied.append(
-                f"{src_sid}  ->  {dst_sid}  (pointerSpeed value -> {src_val})"
+                f"{src_sid}  ->  {dst_sid}  (pointerSpeed {dst_key} -> {src_val})"
             )
+
+        elif item.mode == "merge":
+            merged = deep_merge(assignments[si].get("card", {}),
+                                assignments[di].get("card", {}))
+            assignments[di]["card"] = retarget_refs(merged, src_prefix, dst_prefix)
+            applied.append(
+                f"{src_sid}  ->  {dst_sid}  (merged, destination-only fields kept)")
+
         else:
             skipped.append((f"{item.src_button}->{item.dst_button}",
                             f"unknown mode '{item.mode}'"))
@@ -1106,6 +1477,7 @@ def apply_plan_dynamic(data: dict, plan: list[PlanItem],
 
 def _run_preset_migration(plat: Platform, data: dict, assume_yes: bool) -> None:
     """Run the hardcoded MX Ergo → MX Ergo S preset migration."""
+    RESULT["action"] = "preset-migrate"
     settings_db = plat.settings_db
 
     log.info(bold("=== Logi Options+ MX Ergo → MX Ergo S migration ==="))
@@ -1137,14 +1509,19 @@ def _run_preset_migration(plat: Platform, data: dict, assume_yes: bool) -> None:
         return
 
     # Execute
-    stop_ctx = plat.stop_logi_options(assume_yes)
+    stop_ctx = None if DRY_RUN else plat.stop_logi_options(assume_yes)
     try:
-        plat.wait_db_free(settings_db)
+        if not DRY_RUN:
+            plat.wait_db_free(settings_db)
 
-        log.info("Creating backup…")
-        bdir = make_backup(plat)
+        if DRY_RUN:
+            bdir = plat.get_lop_dir() / "(dry run: no backup created)"
+        else:
+            log.info("Creating backup…")
+            bdir = make_backup(plat)
         log.info("  backup dir: %s", bdir)
-        fh = logging.FileHandler(bdir / "migration.log")
+        fh = (logging.NullHandler() if DRY_RUN
+              else logging.FileHandler(bdir / "migration.log"))
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter(
             "%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S"))
@@ -1157,19 +1534,661 @@ def _run_preset_migration(plat: Platform, data: dict, assume_yes: bool) -> None:
             log.warning("Nothing was applied. Skipping write.")
         else:
             save_settings(settings_db, row_id, data2)
-            log.info(green(f"Wrote {len(applied)} change(s) to settings.db:"))
+            verb = "Would write" if DRY_RUN else "Wrote"
+            log.info(green(f"{verb} {len(applied)} change(s) to settings.db:"))
+            RESULT.update(ok=True, applied=list(applied), backup=str(bdir),
+                          skipped=[f"{a}: {b}" for a, b in skipped])
             for a in applied:
                 log.info("  %s", a)
         for sid, why in skipped:
             log.warning("  skipped %s — %s", sid, why)
 
     finally:
-        plat.start_logi_options(stop_ctx)
+        if not DRY_RUN:
+            plat.start_logi_options(stop_ctx)
 
     log.info("")
     log.info(green("Done."))
     log.info("If anything looks wrong, restore with:")
     log.info("    python %s --restore '%s'", Path(__file__).name, bdir)
+
+
+# ---------------------------------------------------------------------------
+# Portable layout: export, edit, import
+# ---------------------------------------------------------------------------
+
+LAYOUT_VERSION = 1
+
+# USB HID keyboard usage ids. The database stores these raw on every platform,
+# which is why a keystroke is the one part of a configuration that ports by
+# number. What the number *means* still differs: 227 is the Windows key on
+# Windows and Command on macOS.
+MODIFIER_IDS = {
+    "ctrl": 224, "shift": 225, "alt": 226, "win": 227,
+    "rctrl": 228, "rshift": 229, "ralt": 230, "rwin": 231,
+}
+MODIFIER_NAMES = {v: k for k, v in MODIFIER_IDS.items()}
+# macOS names for the same two usages, accepted on input, never emitted.
+MODIFIER_IDS.update({"cmd": 227, "rcmd": 231, "opt": 226, "ropt": 230})
+
+HID_KEYS: dict[str, int] = {}
+
+
+def _build_hid_keys() -> None:
+    """Fill HID_KEYS without leaking loop variables into the module namespace."""
+    for index, char in enumerate("abcdefghijklmnopqrstuvwxyz"):
+        HID_KEYS[char] = 4 + index
+    for index, char in enumerate("123456789"):
+        HID_KEYS[char] = 30 + index
+    for index in range(1, 13):
+        HID_KEYS[f"f{index}"] = 57 + index
+
+
+_build_hid_keys()
+HID_KEYS.update({
+    "0": 39, "enter": 40, "esc": 41, "backspace": 42, "tab": 43, "space": 44,
+    "-": 45, "=": 46, "[": 47, "]": 48, "\\": 49, ";": 51, "'": 52, "`": 53,
+    ",": 54, ".": 55, "/": 56, "capslock": 57,
+    "printscreen": 70, "scrolllock": 71, "pause": 72, "insert": 73,
+    "home": 74, "pageup": 75, "delete": 76, "end": 77, "pagedown": 78,
+    "right": 79, "left": 80, "down": 81, "up": 82,
+})
+HID_CODES = {v: k for k, v in HID_KEYS.items()}
+
+GESTURE_DIRECTIONS = ("click", "up", "down", "left", "right", "horizontal", "vertical")
+
+
+def _display_character(key: str) -> str:
+    named = {"left": "Left", "right": "Right", "up": "Up", "down": "Down",
+             "home": "Home", "end": "End", "tab": "Tab", "space": "Space",
+             "enter": "Enter", "esc": "Esc", "delete": "Delete",
+             "pageup": "PageUp", "pagedown": "PageDown"}
+    return named.get(key, key.upper())
+
+
+def _virtual_key_id(key: str) -> str:
+    named = {"left": "VK_LEFT", "right": "VK_RIGHT", "up": "VK_UP", "down": "VK_DOWN",
+             "home": "VK_HOME", "end": "VK_END", "tab": "VK_TAB", "space": "VK_SPACE",
+             "enter": "VK_RETURN", "esc": "VK_ESCAPE", "delete": "VK_DELETE",
+             "`": "VK_GRAVE"}
+    return named.get(key, f"VK_{key.upper()}")
+
+
+def describe_action(card: dict) -> dict:
+    """One direction's card, as a portable action.
+
+    Anything the vocabulary below cannot express is kept verbatim under `raw`,
+    so an export never silently loses a card it did not understand.
+    """
+    macro = card.get("macro") or {}
+    kind = macro.get("type")
+    if card.get("attribute") == MACRO_REF_ATTRIBUTE and isinstance(card.get("id"), str):
+        return {"kind": "smart_action", "id": card["id"]}
+    if kind == "SYSTEM":
+        return {"kind": "system", "action": macro.get("system", {}).get("action")}
+    if kind == "MOUSE":
+        return {"kind": "mouse", "action": macro.get("mouse", {}).get("action"),
+                "hidUsage": macro.get("mouse", {}).get("hidUsage")}
+    if kind == "MEDIA":
+        return {"kind": "media", "usage": macro.get("media", {}).get("usage")}
+    if kind == "QUICK_LAUNCH":
+        return {"kind": "quick_launch",
+                "action": macro.get("quickLaunch", {}).get("action")}
+    if kind == "KEYSTROKE":
+        ks = macro.get("keystroke", {})
+        code = ks.get("code")
+        action = {"kind": "keystroke",
+                  "modifiers": [MODIFIER_NAMES.get(m, m) for m in ks.get("modifiers", [])],
+                  "key": HID_CODES.get(code, code) if code is not None else None}
+        if code is None and ks.get("displayCharacter"):
+            # A modifier held on its own, such as the Alt hold a horizontal
+            # gesture uses. There is no key code, only a label.
+            action["display"] = ks["displayCharacter"]
+        return action
+    if macro.get("doNothing") is not None or str(card.get("id", "")).endswith("do_nothing"):
+        return {"kind": "nothing"}
+    if not macro and str(card.get("id", "")).startswith("card_global_presets_"):
+        # A preset card carries no macro; the id is the action. Several are
+        # platform specific (`_osx_`, `_win_`), so this must not be copied blind.
+        return {"kind": "preset", "id": card["id"]}
+    return {"kind": "raw", "card": copy.deepcopy(card)}
+
+
+def keystroke_card(modifiers: list, key: Optional[str],
+                   display: Optional[str] = None) -> dict:
+    """A user-defined keyboard shortcut, in the shape the application writes.
+
+    Verified byte-identical against a card Logi Options+ produced for the same
+    chord: modifiers ascending, `virtualKeyId` present, four tags. `key` may be
+    None, which is how a gesture holds a modifier on its own.
+    """
+    mods = sorted({MODIFIER_IDS[m.lower()] for m in modifiers})
+    if key is None:
+        keystroke: dict = {"modifiers": mods}
+        if display:
+            keystroke["displayCharacter"] = display
+    else:
+        code = HID_KEYS[key.lower()] if isinstance(key, str) else int(key)
+        keystroke = {"code": code,
+                     "displayCharacter": _display_character(str(key).lower()),
+                     "modifiers": mods,
+                     "virtualKeyId": _virtual_key_id(str(key).lower())}
+    return {
+        "attribute": "MACRO_PLAYBACK",
+        "icons": {"icons": ["Shortcut.png", "Shortcut.svg"],
+                  "uri": "pipeline://system_actions/"},
+        "id": "card_global_presets_keyboard_shortcut",
+        "macro": {"actionName": "keyboard_none",
+                  "keystroke": keystroke,
+                  "type": "KEYSTROKE"},
+        "name": "ASSIGNMENT_NAME_KEYBOARD_SHORTCUT",
+        "tags": ["PRESET_TAG_KEY_OR_BUTTON", "PRESET_TAG_MACROS_UNSUPPORTED",
+                 "PRESET_TAG_PRESENTER_BUTTON", "PRESET_KEYBOARD_FUNCTIONS"],
+        "taskId": 65536,
+    }
+
+
+def action_catalogue(data: dict) -> dict:
+    """Every non-keystroke card the document already contains, by action.
+
+    Logi Options+ owns the vocabulary: icons, tags and taskId belong to the
+    action and cannot be invented. So a system, mouse or media action can only
+    be written if this database already holds a card for it somewhere.
+    """
+    catalogue: dict = {}
+
+    def visit(node):
+        if isinstance(node, dict):
+            action = describe_action(node) if "macro" in node or "attribute" in node else None
+            if action and action["kind"] in ("system", "mouse", "media", "nothing",
+                                              "preset", "quick_launch"):
+                key = (action["kind"],
+                       action.get("action") or action.get("usage") or action.get("id"))
+                catalogue.setdefault(key, copy.deepcopy(node))
+            for v in node.values():
+                visit(v)
+        elif isinstance(node, list):
+            for v in node:
+                visit(v)
+
+    visit(resolve_profile(data))
+    return catalogue
+
+
+# Cross-platform action equivalences, from the two databases measured side by
+# side. Only `BUTTON` is shared verbatim between the platforms; everything here
+# is a judgement about intent, so translation is opt-in (--translate) and every
+# substitution is reported.
+ACTION_ALIASES: dict = {
+    # macOS -> Windows
+    ("system", "MISSION_CONTROL"): {"kind": "system", "action": "TASK_VIEW"},
+    ("system", "APP_EXPOSE"): {"kind": "system", "action": "TASK_VIEW"},
+    ("system", "SWITCH_BETWEEN_DESKTOPS_LEFT"):
+        {"kind": "keystroke", "modifiers": ["ctrl", "win"], "key": "left"},
+    ("system", "SWITCH_BETWEEN_DESKTOPS_RIGHT"):
+        {"kind": "keystroke", "modifiers": ["ctrl", "win"], "key": "right"},
+    ("mouse", "OSX_GESTURE_BACK"): {"kind": "mouse", "action": "WIN_BACK"},
+    ("mouse", "OSX_GESTURE_FORWARD"): {"kind": "mouse", "action": "WIN_FORWARD"},
+    # Windows -> macOS
+    ("system", "TASK_VIEW"): {"kind": "system", "action": "MISSION_CONTROL"},
+    ("mouse", "WIN_BACK"): {"kind": "mouse", "action": "OSX_GESTURE_BACK"},
+    ("mouse", "WIN_FORWARD"): {"kind": "mouse", "action": "OSX_GESTURE_FORWARD"},
+    # Preset cards, which carry the action in the id and no macro block.
+    ("preset", "card_global_presets_osx_mission_control"):
+        {"kind": "system", "action": "TASK_VIEW"},
+    ("preset", "card_global_presets_osx_back"): {"kind": "mouse", "action": "WIN_BACK"},
+    ("preset", "card_global_presets_osx_forward"): {"kind": "mouse", "action": "WIN_FORWARD"},
+    ("preset", "card_global_presets_win_back"): {"kind": "mouse", "action": "OSX_GESTURE_BACK"},
+    ("preset", "card_global_presets_win_forward"):
+        {"kind": "mouse", "action": "OSX_GESTURE_FORWARD"},
+    # QUICK_LAUNCH actions: macOS window overviews against the Windows one.
+    ("quick_launch", "MISSION_CONTROL"): {"kind": "system", "action": "TASK_VIEW"},
+    ("quick_launch", "APP_EXPOSE"): {"kind": "system", "action": "TASK_VIEW"},
+    ("system", "TASK_VIEW_MAC"): {"kind": "quick_launch", "action": "MISSION_CONTROL"},
+}
+
+
+def document_platform(data: dict) -> Optional[str]:
+    """Which platform wrote this configuration, judged by its own vocabulary.
+
+    Preset card ids carry a `_win_` or `_osx_` infix. Counting them is more
+    reliable than the running operating system, because the tool routinely
+    reads a database copied from the other machine.
+    """
+    raw = json.dumps(resolve_profile(data))
+    wins, macs = raw.count("_win_"), raw.count("_osx_")
+    if wins == macs:
+        return None
+    return "WINDOWS" if wins > macs else "MACOS"
+
+
+def gesture_wrapper(data: dict, mode: str) -> Optional[dict]:
+    """A gesture card for `mode`, taken from any slot in this document that has one.
+
+    A slot currently holding a single action, such as a Smart Action or plain
+    scroll, has no gesture structure at all. The application owns that structure,
+    so it is borrowed rather than invented.
+    """
+    found: list = []
+
+    def visit(node):
+        if found:
+            return
+        if isinstance(node, dict):
+            nested = node.get("nestedCards")
+            if isinstance(nested, dict) and mode in nested and node.get("attribute") == "ONE_OF":
+                found.append(node)
+                return
+            for v in node.values():
+                visit(v)
+        elif isinstance(node, list):
+            for v in node:
+                visit(v)
+
+    visit(resolve_profile(data))
+    return copy.deepcopy(found[0]) if found else None
+
+
+def render_action(action: dict, catalogue: dict, translate: bool = False,
+                  platform_name: Optional[str] = None) -> tuple:
+    """Turn a portable action back into a card. Returns (card, reason_if_none)."""
+    kind = action.get("kind")
+    if kind == "keystroke":
+        try:
+            return keystroke_card(action.get("modifiers", []), action.get("key"),
+                                  action.get("display")), None
+        except (KeyError, TypeError, AttributeError) as e:
+            return None, f"cannot build this keystroke: {e}"
+    if kind == "raw":
+        card_id = str(action.get("card", {}).get("id", ""))
+        foreign = {"WINDOWS": "_osx_", "MACOS": "_win_"}.get(platform_name or "")
+        if foreign and foreign in card_id:
+            return None, (f"card {card_id!r} belongs to the other platform and has no "
+                          "known equivalent; assign this action once in Logi Options+, "
+                          "then re-import")
+        return copy.deepcopy(action["card"]), None
+    if kind == "smart_action":
+        return {"attribute": MACRO_REF_ATTRIBUTE, "id": action["id"]}, None
+    if kind in ("system", "mouse", "media", "nothing", "preset", "quick_launch"):
+        key = (kind, action.get("action") or action.get("usage") or action.get("id"))
+        card = catalogue.get(key)
+        if card is not None:
+            return copy.deepcopy(card), None
+        if translate and key in ACTION_ALIASES:
+            alias = ACTION_ALIASES[key]
+            card, why = render_action(alias, catalogue, False, platform_name)
+            if card is not None:
+                label = alias.get("action") or (
+                    "+".join(alias.get("modifiers", [])) + "+" + str(alias.get("key")))
+                return card, f"translated {key[1]} -> {label}"
+            return None, f"{key[1]} translates to {alias}, which this database also lacks"
+        hint = ("" if translate else
+                "  Pass --translate to substitute the closest action on this platform.")
+        what = action.get("action") or action.get("usage") or action.get("id")
+        return None, (f"this database has no card for {kind} {what!r}; "
+                      f"assign it once in Logi Options+, then re-import.{hint}")
+    return None, f"unknown action kind {kind!r}"
+
+
+def device_presence(data: dict, prefix: str) -> Optional[str]:
+    """Warn if this installation has no record of the device.
+
+    Nothing in the file says whether a device is connected right now, so this
+    reports what can actually be known: whether the installation has ever seen
+    it. An edit for an absent device is still valid, and Logi Options+ picks it
+    up the next time the device connects.
+    """
+    seen = set(data.get("slot_prefixes_ever_seen", []) or [])
+    ecd = data.get("ever_connected_devices", {})
+    for dev in (ecd.get("devices", []) if isinstance(ecd, dict) else []):
+        if isinstance(dev, dict) and isinstance(dev.get("slotPrefix"), str):
+            seen.add(dev["slotPrefix"])
+    if prefix in seen:
+        return (f"{prefix}: this installation has seen this device before. It does not "
+                "need to be connected now; Logi Options+ applies the change the next "
+                "time it sees it.")
+    return (f"{prefix}: this installation has NO record of ever seeing this device. "
+            "Its slots may be stale or incomplete, so check the result in Logi "
+            "Options+ once the device is connected.")
+
+
+def export_layout(data: dict, prefix: str) -> dict:
+    """The gesture and button layout of one device, as a portable document."""
+    profile = resolve_profile(data)
+    prefixes = known_prefixes(data)
+    slots: dict = {}
+    for a in profile.get("assignments", []):
+        sid = a.get("slotId", "")
+        pfx, suffix = split_slot_id(sid, prefixes)
+        if pfx != prefix or not is_button_slot(suffix):
+            continue
+        card = a.get("card", {})
+        mode = card.get("selectedNestedCard")
+        if mode and mode in card.get("nestedCards", {}):
+            inner = card["nestedCards"][mode].get("nestedCards", {})
+            slots[suffix] = {
+                "mode": mode,
+                "directions": {d: describe_action(inner[d])
+                               for d in GESTURE_DIRECTIONS if d in inner},
+            }
+        else:
+            slots[suffix] = {"mode": None, "action": describe_action(card)}
+    return {"version": LAYOUT_VERSION, "device": prefix, "slots": slots}
+
+
+def import_layout(data: dict, layout: dict, prefix: str,
+                  slot_map: Optional[dict] = None, translate: bool = False) -> tuple:
+    """Apply a portable layout to a device. Returns (applied, skipped).
+
+    `slot_map` renames a source slot to the destination's control id, which is
+    what a firmware change between device generations requires: the same
+    physical button is c237 on the MX Ergo and c253 on the MX Ergo S.
+    """
+    if layout.get("version") != LAYOUT_VERSION:
+        raise SystemExit(red(f"layout version {layout.get('version')} is not supported "
+                             f"(this tool writes version {LAYOUT_VERSION})"))
+    profile = resolve_profile(data)
+    assignments = profile.get("assignments", [])
+    catalogue = action_catalogue(data)
+    platform_name = document_platform(data)
+    aliases = dict(layout.get("slot_aliases") or {})
+    aliases.update(slot_map or {})
+    applied: list = []
+    skipped: list = []
+    notes: list = []
+
+    for source_suffix, spec in sorted(layout.get("slots", {}).items()):
+        suffix = aliases.get(source_suffix, source_suffix)
+        sid = f"{prefix}_{suffix}"
+        idx = find_assignment(assignments, sid)
+        if idx is None:
+            skipped.append((suffix, f"destination has no slot {sid}"))
+            continue
+        card = assignments[idx].get("card", {})
+        mode = spec.get("mode")
+
+        if mode is None:
+            new_card, why = render_action(spec.get("action", {}), catalogue, translate, platform_name)
+            if new_card is None:
+                skipped.append((suffix, why))
+                continue
+            assignments[idx]["card"] = new_card
+            applied.append(f"{sid}  (single action)")
+            continue
+
+        nested = card.get("nestedCards", {})
+        if mode not in nested:
+            borrowed = gesture_wrapper(data, mode)
+            if borrowed is None:
+                skipped.append((suffix, f"no gesture card for mode {mode!r} exists "
+                                        "anywhere in this database"))
+                continue
+            borrowed = retarget_refs(borrowed, layout.get("device", prefix), prefix)
+            assignments[idx]["card"] = borrowed
+            assignments[idx]["cardId"] = borrowed.get("id", assignments[idx].get("cardId"))
+            card = borrowed
+            nested = card.get("nestedCards", {})
+            notes.append(f"{suffix}: slot had no gesture structure, borrowed a {mode!r} card")
+        target = nested[mode].setdefault("nestedCards", {})
+        wrote = []
+        for direction, action in spec.get("directions", {}).items():
+            new_card, why = render_action(action, catalogue, translate, platform_name)
+            if new_card is None:
+                skipped.append((f"{suffix}.{direction}", why))
+                continue
+            if why:
+                notes.append(f"{suffix}.{direction}: {why}")
+            target[direction] = new_card
+            wrote.append(direction)
+        if wrote:
+            card["selectedNestedCard"] = mode
+            applied.append(f"{sid}  [{mode}]  {', '.join(wrote)}")
+    for note in notes:
+        skipped.append(("note", note))
+    return applied, skipped
+
+
+def _execute_layout_import(plat: Platform, layout: dict, prefix: str,
+                           assume_yes: bool, slot_map: Optional[dict] = None,
+                           translate: bool = False) -> None:
+    """Apply a layout through the same stop, backup, write, restart lifecycle."""
+    RESULT["action"] = "import-layout"
+    settings_db = plat.settings_db
+    row_id, preview = load_settings(settings_db, for_write=False)
+    applied, skipped = import_layout(copy.deepcopy(preview), layout, prefix,
+                                     slot_map, translate)
+
+    note = device_presence(preview, prefix)
+    log.info(bold(f"Layout import: {layout.get('device','?')} -> {prefix}"))
+    if note:
+        log.warning("  %s %s", yellow("!"), note)
+    for line in applied:
+        log.info("  %s %s", green("+"), line)
+    for slot, why in skipped:
+        if slot == "note":
+            log.info("  %s %s", yellow("~"), why)
+        else:
+            log.warning("  %s %s — %s", yellow("!"), slot, why)
+    if not applied:
+        raise SystemExit(yellow("Nothing to apply."))
+    if not confirm(bold(f"Apply {len(applied)} slot change(s)?"),
+                   default_no=True, assume_yes=assume_yes):
+        log.info("Aborted.")
+        return
+
+    stop_ctx = None if DRY_RUN else plat.stop_logi_options(assume_yes)
+    try:
+        if not DRY_RUN:
+            plat.wait_db_free(settings_db)
+        if DRY_RUN:
+            bdir = plat.get_lop_dir() / "(dry run: no backup created)"
+        else:
+            log.info("Creating backup…")
+            bdir = make_backup(plat)
+        log.info("  backup dir: %s", bdir)
+        fh = (logging.NullHandler() if DRY_RUN
+              else logging.FileHandler(bdir / "migration.log"))
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",
+                                          datefmt="%H:%M:%S"))
+        log.addHandler(fh)
+        try:
+            row_id, data = load_settings(settings_db)
+            applied, skipped = import_layout(data, layout, prefix, slot_map, translate)
+            save_settings(settings_db, row_id, data)
+            verb = "Would write" if DRY_RUN else "Wrote"
+            log.info(green(f"{verb} {len(applied)} slot change(s)."))
+            RESULT.update(ok=True, applied=list(applied), backup=str(bdir),
+                          skipped=[f"{a}: {b}" for a, b in skipped])
+        finally:
+            log.removeHandler(fh)
+            fh.close()
+    finally:
+        if not DRY_RUN:
+            plat.start_logi_options(stop_ctx)
+    log.info("Restore with:  python3 %s --restore '%s'", Path(__file__).name, bdir)
+
+
+# ---------------------------------------------------------------------------
+# Running against a live Windows install from WSL
+# ---------------------------------------------------------------------------
+
+# What the elevated run reports back. Never infer success from an exit code:
+# `Start-Process -Verb RunAs` returns whether UAC was accepted, not what the
+# elevated process did, so the parent reads this file instead.
+RESULT: dict = {"ok": False, "action": None, "applied": [], "skipped": [], "backup": None}
+
+_RC_RE = re.compile(r"^(\S+)_rc=(-?\d+)$")
+
+
+def is_wsl() -> bool:
+    if sys.platform != "linux":
+        return False
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+def _powershell(command: str) -> subprocess.CompletedProcess:
+    return _run(["powershell.exe", "-NoProfile", "-Command", command])
+
+
+def _to_windows_path(p: Path) -> str:
+    cp = _run(["wslpath", "-w", str(p)])
+    if cp.returncode != 0 or not cp.stdout.strip():
+        raise SystemExit(red(f"could not convert {p} to a Windows path"))
+    return cp.stdout.strip()
+
+
+def _windows_temp_dir() -> tuple:
+    """(path usable from WSL, same path in Windows form)."""
+    cp = _powershell("$env:TEMP")
+    win_dir = cp.stdout.strip()
+    if cp.returncode != 0 or not win_dir:
+        raise SystemExit(red("could not read the Windows TEMP directory"))
+    cp = _run(["wslpath", "-u", win_dir])
+    if cp.returncode != 0 or not cp.stdout.strip():
+        raise SystemExit(red(f"could not convert {win_dir} to a WSL path"))
+    return Path(cp.stdout.strip()), win_dir
+
+
+def _find_windows_python() -> Optional[str]:
+    """The Windows Python that will run the elevated copy."""
+    for probe in (["py.exe", "-3", "-c", "import sys;print(sys.executable)"],
+                  ["python.exe", "-c", "import sys;print(sys.executable)"]):
+        cp = _run(probe)
+        if cp.returncode == 0 and cp.stdout.strip():
+            return cp.stdout.strip()
+    return None
+
+
+def _read_windows_text(path: Path) -> str:
+    """Read a file the elevated Windows console wrote.
+
+    A redirected Python process on Windows writes the ANSI codepage, not UTF-8.
+    """
+    if not path.exists():
+        return ""
+    raw = path.read_bytes()
+    for encoding in ("utf-8", "cp1252"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def run_elevated_on_windows(passthrough: list) -> int:
+    """Re-run this script on the Windows side, elevated, and verify by artefact.
+
+    The tool must stop a Windows service and edit a file the running application
+    owns, and neither is possible from WSL: `sys.platform` is linux here, and
+    the service control needs Administrator. So the same script is copied to the
+    Windows temp directory and launched through a UAC prompt.
+    """
+    if not is_wsl():
+        raise SystemExit(red("--elevate is only for running from WSL against Windows"))
+    py_exe = _find_windows_python()
+    if py_exe is None:
+        raise SystemExit(red(
+            "no Windows Python found. Install it from python.org or the Microsoft "
+            "Store so that `py.exe` or `python.exe` resolves from WSL."))
+
+    write_dir, win_dir = _windows_temp_dir()
+    nonce = uuid.uuid4().hex[:12]
+    script_copy = write_dir / f"migrate_logi_ergo-{nonce}.py"
+    cmd_path = write_dir / f"migrate_logi_ergo-{nonce}.cmd"
+    log_path = write_dir / f"migrate_logi_ergo-{nonce}.log"
+    result_path = write_dir / f"migrate_logi_ergo-{nonce}.json"
+
+    # Copy rather than run over the WSL network share: an elevated process does not
+    # reliably see the WSL share, and the script has no imports outside stdlib.
+    shutil.copy2(Path(__file__).resolve(), script_copy)
+
+    # Input files named on the command line live on the Linux side, which the
+    # elevated Windows process cannot read. Copy them across and rewrite the
+    # argument to the Windows path.
+    copied_inputs: list = []
+    passthrough = list(passthrough)
+    for flag in ("--import-layout",):
+        if flag in passthrough:
+            i = passthrough.index(flag) + 1
+            if i >= len(passthrough):
+                raise SystemExit(red(f"{flag} needs a path"))
+            source = Path(passthrough[i]).expanduser()
+            if not source.is_file():
+                raise SystemExit(red(f"{flag}: {source} is not a file"))
+            target = write_dir / f"migrate_logi_ergo-{nonce}-{source.name}"
+            shutil.copy2(source, target)
+            copied_inputs.append(target)
+            passthrough[i] = f"{win_dir}\\{target.name}"
+    for flag in ("--export-layout", "--restore", "--db"):
+        if flag in passthrough:
+            raise SystemExit(red(
+                f"{flag} cannot be combined with --elevate yet: the elevated process "
+                "writes on the Windows side and this would need the result copied back. "
+                "Run that command directly from a Windows shell instead."))
+
+    win = {p: f"{win_dir}\\{p.name}" for p in (script_copy, cmd_path, log_path, result_path)}
+    argv = " ".join(f'"{a}"' if " " in a else a for a in passthrough)
+    lines = [
+        f'"{py_exe}" "{win[script_copy]}" {argv} --result-file "{win[result_path]}"'
+        f' >> "{win[log_path]}" 2>&1',
+        f'echo run_rc=%ERRORLEVEL% >> "{win[log_path]}"',
+    ]
+    # CRLF, and newline="" so Python does not double the \r already written.
+    cmd_path.write_text("\r\n".join(lines) + "\r\n", newline="")
+
+    log.info("Requesting elevation. Approve the UAC prompt on the Windows desktop…")
+    ps_out = write_dir / f"migrate_logi_ergo-{nonce}.ps.txt"
+    try:
+        # Real file handles, never pipes. The elevated run restarts Logi Options+,
+        # and a long-lived child that inherits a pipe keeps it open, so
+        # capture_output would block here long after the work has finished.
+        with open(ps_out, "wb") as sink:
+            proc = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command",
+                 f"Start-Process -Verb RunAs -Wait -FilePath '{win[cmd_path]}'"],
+                stdin=subprocess.DEVNULL, stdout=sink, stderr=sink)
+        if proc.returncode != 0:
+            detail = ps_out.read_text(errors="replace").strip() if ps_out.exists() else ""
+            raise SystemExit(red(
+                "the UAC prompt was declined or could not be shown.\n"
+                f"  {detail}"))
+        log_text = _read_windows_text(log_path)
+        result = json.loads(result_path.read_text()) if result_path.exists() else None
+    finally:
+        for f in [script_copy, cmd_path, log_path, result_path, ps_out, *copied_inputs]:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    for line in log_text.splitlines():
+        print("   " + line)
+
+    codes = dict(m.groups() for m in
+                 (_RC_RE.match(l.strip()) for l in log_text.splitlines()) if m)
+    if "run" not in codes:
+        raise SystemExit(red(
+            "the elevated run reported no result code. The command file most "
+            "likely failed before it could write its log."))
+    if result is None:
+        raise SystemExit(red(
+            f"the elevated run exited with code {codes['run']} but wrote no result "
+            "file, so nothing can be confirmed. Treat the configuration as unchanged "
+            "and check the log above."))
+    if not result.get("ok"):
+        log.error(red(f"the elevated run reported failure: {result.get('error')}"))
+        return 1
+
+    log.info(green(f"elevated run confirmed: {result.get('action')}"))
+    for line in result.get("applied", []):
+        log.info("    %s", line)
+    if result.get("backup"):
+        log.info("  backup: %s", result["backup"])
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1186,35 +2205,140 @@ def parse_args() -> argparse.Namespace:
                    help="restore settings.db / macros.db from a backup folder")
     ap.add_argument("-y", "--yes", action="store_true",
                     help="assume 'yes' to all confirmations")
+    ap.add_argument("--db", metavar="PATH",
+                    help="operate on this settings.db instead of the live one. "
+                         "No process is stopped or started. Works on any OS, "
+                         "including Linux, and on a copy or a backup.")
+    g.add_argument("--export-layout", metavar="FILE",
+                   help="write one device's button and gesture layout to a "
+                        "portable JSON file")
+    g.add_argument("--import-layout", metavar="FILE",
+                   help="apply a layout JSON file to a device")
+    ap.add_argument("--device", metavar="PREFIX",
+                    help="device slot prefix for --export-layout / --import-layout, "
+                         "for example mx-ergo-s-2b03e")
+    ap.add_argument("--map", metavar="OLD=NEW", action="append", default=[],
+                    help="rename a slot on import, for example --map c237=c253 "
+                         "when a firmware change moved the same physical button. "
+                         "Repeatable.")
+    ap.add_argument("--translate", action="store_true",
+                    help="on import, substitute the closest action of the "
+                         "destination platform when the source action does not "
+                         "exist there. Every substitution is reported.")
+    ap.add_argument("--elevate", action="store_true",
+                    help="from WSL, re-run this script on the Windows side behind a "
+                         "UAC prompt, then confirm the outcome from the result file "
+                         "it writes. Requires -y.")
+    ap.add_argument("--result-file", metavar="PATH", help=argparse.SUPPRESS)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="build and print the plan, then stop. Writes nothing "
+                         "and stops no process.")
     return ap.parse_args()
 
 
 def main() -> None:
+    global DRY_RUN
     args = parse_args()
-    plat = get_platform()
+    setup_logging()
+    DRY_RUN = args.dry_run
+
+    if args.elevate:
+        if not args.yes:
+            raise SystemExit(red(
+                "--elevate needs -y. The elevated run happens in its own console "
+                "with its output redirected to a log, so it cannot ask you anything."))
+        passthrough = [a for a in sys.argv[1:] if a != "--elevate"]
+        raise SystemExit(run_elevated_on_windows(passthrough))
+
+    if is_wsl() and not args.db and not args.elevate:
+        log.warning(yellow(
+            "This is WSL, where Logi Options+ does not run. Use --db PATH to work on "
+            "a copy, or --elevate -y to drive the live Windows install."))
+    db_override = Path(args.db).expanduser() if args.db else None
+    if db_override is not None and not db_override.exists():
+        raise SystemExit(red(f"--db path does not exist: {db_override}"))
+    plat = get_platform(db_override)
+    if DRY_RUN:
+        log.info(yellow("dry run: nothing will be written and nothing stopped"))
 
     if args.restore:
+        RESULT["action"] = "restore"
         restore_from_backup(plat, Path(args.restore).expanduser(), assume_yes=args.yes)
+        RESULT["ok"] = True
         return
 
     settings_db = plat.settings_db
     if not settings_db.exists():
         raise SystemExit(red(f"settings.db not found at {settings_db}"))
 
+    if args.export_layout or args.import_layout:
+        if not args.device:
+            _, peek = load_settings(settings_db, for_write=False)
+            names = ", ".join(sorted(discover_devices(peek)))
+            raise SystemExit(red(f"--device is required. Devices in this database: {names}"))
+
+    if args.export_layout:
+        _, data = load_settings(settings_db, for_write=False)
+        layout = export_layout(data, args.device)
+        if not layout["slots"]:
+            raise SystemExit(red(f"no button slots found for device {args.device!r}"))
+        out = Path(args.export_layout).expanduser()
+        out.write_text(json.dumps(layout, indent=2) + "\n")
+        log.info(green(f"wrote {len(layout['slots'])} slot(s) to {out}"))
+        return
+
+    if args.import_layout:
+        layout = json.loads(Path(args.import_layout).expanduser().read_text())
+        slot_map = {}
+        for pair in args.map:
+            if "=" not in pair:
+                raise SystemExit(red(f"--map expects OLD=NEW, got {pair!r}"))
+            old, new = pair.split("=", 1)
+            slot_map[old.strip()] = new.strip()
+        _execute_layout_import(plat, layout, args.device, assume_yes=args.yes,
+                               slot_map=slot_map, translate=args.translate)
+        return
+
     if args.apply:
         # Preset migration mode (backward compatible)
-        setup_logging()
-        _, data = load_settings(settings_db)
+        _, data = load_settings(settings_db, for_write=False)
         _run_preset_migration(plat, data, assume_yes=args.yes)
     else:
         # Interactive menu mode (new default)
         run_interactive(plat)
 
 
+def _write_result(path: str) -> None:
+    try:
+        Path(path).write_text(json.dumps(RESULT, indent=2) + "\n")
+    except OSError as e:
+        log.error("could not write the result file %s: %s", path, e)
+
+
 if __name__ == "__main__":
+    _result_file = None
+    for _i, _a in enumerate(sys.argv):
+        if _a == "--result-file" and _i + 1 < len(sys.argv):
+            _result_file = sys.argv[_i + 1]
     try:
         main()
     except KeyboardInterrupt:
+        RESULT["error"] = "interrupted"
+        if _result_file:
+            _write_result(_result_file)
         print()
         sys.stderr.write(red("Interrupted.\n"))
         sys.exit(130)
+    except SystemExit as e:
+        if _result_file and not RESULT.get("ok"):
+            RESULT["error"] = str(e) or f"exit {e.code}"
+            _write_result(_result_file)
+        raise
+    except Exception as e:                       # noqa: BLE001 - reported, then re-raised
+        RESULT["error"] = f"{type(e).__name__}: {e}"
+        if _result_file:
+            _write_result(_result_file)
+        raise
+    else:
+        if _result_file:
+            _write_result(_result_file)

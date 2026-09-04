@@ -1,0 +1,39 @@
+# Editors / IDEs
+.idea/
+
+# Claude Code local state
+/.claude/
+/.remember/
+
+# Local-only overrides and working data, never committed
+/_local/
+settings.local.json
+*.local.json
+*.local.md
+
+# Never commit real Logi Options+ data: it carries host names and serial numbers
+*.db
+*.db-wal
+*.db-shm
+_migration_backup_*/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# Databases, backups and generated output: never tracked, by any route
+*.sqlite
+*.sqlite3
+*.db-journal
+*.bak
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+logi-backup-*/
+/out/
+/output/
+/backups/
